@@ -6,19 +6,10 @@ import { initSubagentRegistry } from "../agents/subagent-registry.js";
 import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
 import type { CanvasHostServer } from "../canvas-host/server.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
-import { formatCliCommand } from "../cli/command-format.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { isRestartEnabled } from "../config/commands.js";
-import {
-  CONFIG_PATH,
-  type OpenClawConfig,
-  isNixMode,
-  loadConfig,
-  migrateLegacyConfig,
-  readConfigFileSnapshot,
-  writeConfigFile,
-} from "../config/config.js";
-import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import { type OpenClawConfig, isNixMode, loadConfig } from "../config/config.js";
+import { createConfigSource } from "../config/create-config-source.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
 import { clearAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
 import {
@@ -209,55 +200,13 @@ export async function startGatewayServer(
     description: "raw stream log path override",
   });
 
-  let configSnapshot = await readConfigFileSnapshot();
-  if (configSnapshot.legacyIssues.length > 0) {
-    if (isNixMode) {
-      throw new Error(
-        "Legacy config entries detected while running in Nix mode. Update your Nix config to the latest schema and restart.",
-      );
-    }
-    const { config: migrated, changes } = migrateLegacyConfig(configSnapshot.parsed);
-    if (!migrated) {
-      throw new Error(
-        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("openclaw doctor")}" to migrate.`,
-      );
-    }
-    await writeConfigFile(migrated);
-    if (changes.length > 0) {
-      log.info(
-        `gateway: migrated legacy config entries:\n${changes
-          .map((entry) => `- ${entry}`)
-          .join("\n")}`,
-      );
-    }
-  }
-
-  configSnapshot = await readConfigFileSnapshot();
-  if (configSnapshot.exists && !configSnapshot.valid) {
-    const issues =
-      configSnapshot.issues.length > 0
-        ? configSnapshot.issues
-            .map((issue) => `${issue.path || "<root>"}: ${issue.message}`)
-            .join("\n")
-        : "Unknown validation issue.";
-    throw new Error(
-      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`,
-    );
-  }
-
-  const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
-  if (autoEnable.changes.length > 0) {
-    try {
-      await writeConfigFile(autoEnable.config);
-      log.info(
-        `gateway: auto-enabled plugins:\n${autoEnable.changes
-          .map((entry) => `- ${entry}`)
-          .join("\n")}`,
-      );
-    } catch (err) {
-      log.warn(`gateway: failed to persist plugin auto-enable changes: ${String(err)}`);
-    }
-  }
+  const cfgSource = createConfigSource(process.env);
+  const sourceLog = {
+    info: log.info.bind(log),
+    warn: log.warn.bind(log),
+    error: log.error.bind(log),
+  };
+  let cfgAtStart: OpenClawConfig = await cfgSource.startup(sourceLog);
 
   let secretsDegraded = false;
   const emitSecretsStateEvent = (
@@ -324,32 +273,18 @@ export async function startGatewayServer(
       }
     });
 
-  // Fail fast before startup if required refs are unresolved.
-  let cfgAtStart: OpenClawConfig;
-  {
-    const freshSnapshot = await readConfigFileSnapshot();
-    if (!freshSnapshot.valid) {
-      const issues =
-        freshSnapshot.issues.length > 0
-          ? freshSnapshot.issues
-              .map((issue) => `${issue.path || "<root>"}: ${issue.message}`)
-              .join("\n")
-          : "Unknown validation issue.";
-      throw new Error(`Invalid config at ${freshSnapshot.path}.\n${issues}`);
-    }
-    await activateRuntimeSecrets(freshSnapshot.config, {
-      reason: "startup",
-      activate: false,
-    });
-  }
+  // Fail fast before startup if required secret refs are unresolved.
+  await activateRuntimeSecrets(cfgAtStart, {
+    reason: "startup",
+    activate: false,
+  });
 
-  cfgAtStart = loadConfig();
   const authBootstrap = await ensureGatewayStartupAuth({
     cfg: cfgAtStart,
     env: process.env,
     authOverride: opts.auth,
     tailscaleOverride: opts.tailscale,
-    persist: true,
+    persist: cfgSource.persistConfig,
   });
   cfgAtStart = authBootstrap.cfg;
   if (authBootstrap.generatedToken) {
@@ -850,9 +785,18 @@ export async function startGatewayServer(
           logReload,
         });
 
-        return startGatewayConfigReloader({
+        const reloadLog = {
+          info: (msg: string) => logReload.info(msg),
+          warn: (msg: string) => logReload.warn(msg),
+          error: (msg: string) => logReload.error(msg),
+        };
+
+        // Start config source (e.g., HTTP version poller); no-op for file sources
+        const sourceHandle = cfgSource.start?.(reloadLog);
+
+        const configReloader = startGatewayConfigReloader({
           initialConfig: cfgAtStart,
-          readSnapshot: readConfigFileSnapshot,
+          readSnapshot: () => cfgSource.read(),
           onHotReload: async (plan, nextConfig) => {
             const previousSnapshot = getActiveSecretsRuntimeSnapshot();
             const prepared = await activateRuntimeSecrets(nextConfig, {
@@ -874,13 +818,20 @@ export async function startGatewayServer(
             await activateRuntimeSecrets(nextConfig, { reason: "restart-check", activate: false });
             requestGatewayRestart(plan, nextConfig);
           },
-          log: {
-            info: (msg) => logReload.info(msg),
-            warn: (msg) => logReload.warn(msg),
-            error: (msg) => logReload.error(msg),
-          },
-          watchPath: CONFIG_PATH,
+          log: reloadLog,
+          watchPath: cfgSource.watchPath,
         });
+
+        if (sourceHandle) {
+          return {
+            stop: async () => {
+              sourceHandle.stop();
+              await configReloader.stop();
+            },
+          };
+        }
+
+        return configReloader;
       })();
 
   const close = createGatewayCloseHandler({
