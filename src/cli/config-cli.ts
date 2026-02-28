@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
 import type { Command } from "commander";
 import JSON5 from "json5";
 import { readConfigFileSnapshot, writeConfigFile } from "../config/config.js";
 import { isBlockedObjectKey } from "../config/prototype-keys.js";
 import { redactConfigObject } from "../config/redact-snapshot.js";
+import { validateConfigObjectWithPlugins } from "../config/validation.js";
 import { danger, info } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { defaultRuntime } from "../runtime.js";
@@ -360,5 +362,76 @@ export function registerConfigCli(program: Command) {
     .argument("<path>", "Config path (dot or bracket notation)")
     .action(async (path: string) => {
       await runConfigUnset({ path });
+    });
+
+  cmd
+    .command("validate")
+    .description("Validate a config JSON against the OpenClaw Zod schema")
+    .argument("[file]", "JSON file to validate (reads from stdin if omitted)")
+    .option("--json", "Output result as JSON", false)
+    .action(async (file: string | undefined, opts) => {
+      try {
+        let raw: string;
+        if (file) {
+          raw = readFileSync(file, "utf-8");
+        } else {
+          // Read from stdin
+          raw = readFileSync("/dev/stdin", "utf-8");
+        }
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          if (opts.json) {
+            defaultRuntime.log(
+              JSON.stringify({
+                valid: false,
+                issues: [{ message: `JSON parse error: ${String(err)}` }],
+              }),
+            );
+          } else {
+            defaultRuntime.error(danger(`JSON parse error: ${String(err)}`));
+          }
+          defaultRuntime.exit(1);
+          return;
+        }
+
+        const result = validateConfigObjectWithPlugins(parsed);
+
+        if (opts.json) {
+          defaultRuntime.log(
+            JSON.stringify({
+              valid: result.ok,
+              issues: result.ok ? [] : result.issues,
+              warnings: result.warnings ?? [],
+            }),
+          );
+          if (!result.ok) {
+            defaultRuntime.exit(1);
+          }
+          return;
+        }
+
+        if (!result.ok) {
+          defaultRuntime.error(danger("Config validation failed:"));
+          for (const issue of result.issues) {
+            defaultRuntime.error(`  ${issue.path || "<root>"}: ${issue.message}`);
+          }
+          defaultRuntime.exit(1);
+          return;
+        }
+
+        if (result.warnings && result.warnings.length > 0) {
+          for (const w of result.warnings) {
+            defaultRuntime.error(`warning: ${w.path ? `${w.path}: ` : ""}${w.message}`);
+          }
+        }
+
+        defaultRuntime.log(info("Config is valid."));
+      } catch (err) {
+        defaultRuntime.error(danger(String(err)));
+        defaultRuntime.exit(1);
+      }
     });
 }
