@@ -55,6 +55,9 @@ export class HttpConfigSource implements ConfigSource {
   private readonly headers: Record<string, string>;
   private readonly pollIntervalMs: number;
   private readonly label: string;
+  /** Config version captured at startup, used to seed the poller so it
+   *  detects any change between startup() and start(). */
+  private startupVersion = -1;
 
   constructor(opts: HttpConfigSourceOptions) {
     this.url = opts.url;
@@ -82,6 +85,29 @@ export class HttpConfigSource implements ConfigSource {
         .join("\n");
       throw new Error(`Invalid config from ${this.label} source.\n${issues}`);
     }
+    // Set the initial runtime snapshot so loadConfig() works immediately.
+    // This is safe at startup — no reloader is running yet, so there's no
+    // risk of leaking an unapplied config. Subsequent reads go through the
+    // reloader which activates snapshots after deciding the reload strategy.
+    setRuntimeConfigSnapshot(snapshot.config);
+
+    // Capture the config version at startup so the poller (started later via
+    // start()) can detect any changes that occurred between startup() and the
+    // first poll. Without this, the poller's first poll would seed lastVersion
+    // from the current value, silently missing any intermediate changes.
+    try {
+      const versionResponse = await fetch(`${this.url}${this.versionPath}`, {
+        headers: this.headers,
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (versionResponse.ok) {
+        const data = (await versionResponse.json()) as { version: number };
+        this.startupVersion = data.version;
+      }
+    } catch {
+      // Non-fatal: poller will fall back to seeding from first poll
+    }
+
     log.info(`gateway: config loaded from ${this.label} config source`);
     return snapshot.config;
   }
@@ -142,8 +168,12 @@ export class HttpConfigSource implements ConfigSource {
       ),
     );
 
-    // Update loadConfig() cache so runtime callers see reloaded config
-    setRuntimeConfigSnapshot(config);
+    // Note: we do NOT call setRuntimeConfigSnapshot here. The gateway's
+    // config reloader is responsible for activating the snapshot after it
+    // decides whether the change is hot-applicable, restart-required, or
+    // rejected. Calling it here would leak the new config through loadConfig()
+    // before the reloader has applied it — a race that can cause restart-only
+    // changes to take partial effect and break rollback on failed hot reloads.
 
     return {
       path: `<${this.label}>`,
@@ -160,7 +190,10 @@ export class HttpConfigSource implements ConfigSource {
   }
 
   start(log: ConfigSourceLog): { stop: () => void } {
-    let lastVersion = -1;
+    // Seed from startup version if available, so we detect any config changes
+    // that occurred between startup() and now. Falls back to -1 if startup
+    // didn't capture a version (will seed from first poll instead).
+    let lastVersion = this.startupVersion;
     let timer: ReturnType<typeof setInterval> | null = null;
     let stopped = false;
     const sentinelPath = this.watchPath;
@@ -241,7 +274,12 @@ function failSnapshot(label: string, message: string): ConfigFileSnapshot {
  *
  * Required: OPENCLAW_CONFIG_URL
  * Optional: OPENCLAW_CONFIG_HEADERS (JSON), OPENCLAW_CONFIG_POLL_MS,
- *           OPENCLAW_CONFIG_PATH, OPENCLAW_CONFIG_VERSION_PATH
+ *           OPENCLAW_CONFIG_ENDPOINT_PATH, OPENCLAW_CONFIG_VERSION_PATH
+ *
+ * Note: OPENCLAW_CONFIG_ENDPOINT_PATH (not OPENCLAW_CONFIG_PATH) is used for
+ * the HTTP endpoint path. OPENCLAW_CONFIG_PATH already means "path to the
+ * local config file" in paths.ts — reusing it here would silently break
+ * environments that set both the file path and HTTP source.
  */
 export function createHttpConfigSourceFromEnv(
   env: Record<string, string | undefined>,
@@ -266,7 +304,7 @@ export function createHttpConfigSourceFromEnv(
     pollIntervalMs: env.OPENCLAW_CONFIG_POLL_MS
       ? parseInt(env.OPENCLAW_CONFIG_POLL_MS, 10)
       : undefined,
-    configPath: env.OPENCLAW_CONFIG_PATH,
+    configPath: env.OPENCLAW_CONFIG_ENDPOINT_PATH,
     versionPath: env.OPENCLAW_CONFIG_VERSION_PATH,
   });
 }
