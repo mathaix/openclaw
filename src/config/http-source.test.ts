@@ -202,7 +202,7 @@ describe("createHttpConfigSourceFromEnv", () => {
   it("passes custom paths and poll interval", () => {
     const source = createHttpConfigSourceFromEnv({
       OPENCLAW_CONFIG_URL: "http://localhost",
-      OPENCLAW_CONFIG_PATH: "/custom/config",
+      OPENCLAW_CONFIG_ENDPOINT_PATH: "/custom/config",
       OPENCLAW_CONFIG_VERSION_PATH: "/custom/version",
       OPENCLAW_CONFIG_POLL_MS: "10000",
     });
