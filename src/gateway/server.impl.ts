@@ -392,9 +392,11 @@ export async function startGatewayServer(
   );
   // Unconditional startup migration: seed gateway.controlUi.allowedOrigins for existing
   // non-loopback installs that upgraded to v2026.2.26+ without required origins.
+  // Only persist when config source supports writes (file-based); HTTP/metadata sources
+  // receive origins from the server, so writing to a local file would be silently lost.
   cfgAtStart = await maybeSeedControlUiAllowedOriginsAtStartup({
     config: cfgAtStart,
-    writeConfig: writeConfigFile,
+    writeConfig: cfgSource.persistConfig ? writeConfigFile : async () => {},
     log,
   });
 
